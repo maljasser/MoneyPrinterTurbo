@@ -19,6 +19,7 @@ from app.services import (
     elevenlabs_music,
     llm,
     material,
+    shengsuanyun_video,
     sonilo,
     subtitle,
     task_artifacts,
@@ -226,7 +227,12 @@ def _is_cross_post_owner_alive(owner: str | None) -> bool:
     return True
 
 
-def _mark_task_failed(task_id: str, stage: str, error: str) -> dict:
+def _mark_task_failed(
+    task_id: str,
+    stage: str,
+    error: str,
+    details: dict | None = None,
+) -> dict:
     """记录结构化失败信息，并保留任务失败前已经到达的进度。"""
     existing_task = None
     try:
@@ -245,9 +251,7 @@ def _mark_task_failed(task_id: str, stage: str, error: str) -> dict:
 
     message = str(error or "unknown task error").strip()
     progress = int((existing_task or {}).get("progress", 0) or 0)
-    logger.error(
-        f"task failed, task_id: {task_id}, stage: {stage}, error: {message}"
-    )
+    logger.error(f"task failed, task_id: {task_id}, stage: {stage}, error: {message}")
     failure = {
         "task_id": task_id,
         "state": const.TASK_STATE_FAILED,
@@ -255,12 +259,19 @@ def _mark_task_failed(task_id: str, stage: str, error: str) -> dict:
         "failed_stage": stage,
         "error": message,
     }
+    # 某些外部任务已经创建了可用于恢复或排障的远端 ID。失败状态需要保留
+    # 这些非敏感字段，但不能允许调用方覆盖统一的状态、进度和错误结构。
+    failure_details = {
+        key: value for key, value in dict(details or {}).items() if key not in failure
+    }
+    failure.update(failure_details)
     sm.state.update_task(
         task_id,
         state=failure["state"],
         progress=failure["progress"],
         failed_stage=failure["failed_stage"],
         error=failure["error"],
+        **failure_details,
     )
     return failure
 
@@ -505,14 +516,15 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
             return None, None, None
         return custom_audio_file, audio_duration, None
 
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
-    '''
+    """
     Generate subtitle for the video script.
     If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
     Otherwise, it will generate the subtitle using the specified provider.
     Returns:
         - subtitle_path: path to the generated subtitle file
-    '''
+    """
     logger.info("\n\n## generating subtitle")
     if not params.subtitle_enabled:
         return ""
@@ -563,7 +575,15 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def get_video_materials(
+    task_id,
+    params,
+    video_terms,
+    audio_duration,
+    shengsuanyun_video_request: (
+        shengsuanyun_video.ShengsuanConfirmedVideoRequest | None
+    ) = None,
+):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -577,6 +597,55 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+    elif params.video_source == "loomloom":
+        if not isinstance(
+            shengsuanyun_video_request,
+            shengsuanyun_video.ShengsuanConfirmedVideoRequest,
+        ):
+            _mark_task_failed(
+                task_id,
+                "materials",
+                "Shengsuan video generation requires confirmed settings",
+            )
+            return None
+
+        request = shengsuanyun_video_request
+        logger.info(
+            "\n\n## generating "
+            f"{len(request.batch.prompts)} video materials with Shengsuan Cloud"
+        )
+        request_ids = []
+
+        def record_request_id(request_id: str) -> None:
+            """远端任务创建后立即落状态，便于超时或失败时继续定位。"""
+            request_ids.append(request_id)
+            sm.state.patch_task(
+                task_id,
+                shengsuanyun_request_ids=list(request_ids),
+                shengsuanyun_video_model=request.batch.model_id,
+            )
+
+        try:
+            request.validate()
+            backend = shengsuanyun_video.ShengsuanVideoBackend(request.settings)
+            return list(
+                backend.generate_and_download(
+                    request.batch,
+                    utils.task_dir(task_id),
+                    on_request_submitted=record_request_id,
+                )
+            )
+        except (shengsuanyun_video.ShengsuanVideoError, ValueError) as exc:
+            _mark_task_failed(
+                task_id,
+                "materials",
+                str(exc),
+                details={
+                    "shengsuanyun_request_ids": list(request_ids),
+                    "shengsuanyun_video_model": request.batch.model_id,
+                },
+            )
+            return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
@@ -946,9 +1015,7 @@ def _run_cross_post_with_slot(*args) -> None:
         # _run_cross_post 已处理预期异常；这里是最后一道保护，避免未来新增
         # 逻辑抛出的异常只保存在无人读取的 Future 中。
         task_id = str(args[0]) if args else "unknown"
-        logger.exception(
-            f"cross-post worker crashed, task_id: {task_id}, error: {exc}"
-        )
+        logger.exception(f"cross-post worker crashed, task_id: {task_id}, error: {exc}")
         if args:
             _record_cross_post_failure(task_id, exc)
     finally:
@@ -1045,6 +1112,9 @@ def _run_pipeline(
     params: VideoParams,
     stop_at: str = "video",
     voice_preview: dict | None = None,
+    shengsuanyun_video_request: (
+        shengsuanyun_video.ShengsuanConfirmedVideoRequest | None
+    ) = None,
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
@@ -1170,7 +1240,11 @@ def _run_pipeline(
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id,
+        params,
+        video_terms,
+        audio_duration,
+        shengsuanyun_video_request=shengsuanyun_video_request,
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1196,13 +1270,15 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
-        task_id,
-        params,
-        downloaded_videos,
-        audio_file,
-        subtitle_path,
-        audio_duration,
+    final_video_paths, combined_video_paths, generation_warnings = (
+        generate_final_videos(
+            task_id,
+            params,
+            downloaded_videos,
+            audio_file,
+            subtitle_path,
+            audio_duration,
+        )
     )
 
     if not final_video_paths:
@@ -1223,9 +1299,7 @@ def _run_pipeline(
         and upload_post.upload_post_service.auto_upload
     )
     platforms = (
-        list(upload_post.upload_post_service.platforms)
-        if cross_post_enabled
-        else []
+        list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
     )
     should_cross_post = cross_post_enabled and bool(platforms)
     if cross_post_enabled and not platforms:
@@ -1279,6 +1353,9 @@ def start(
     params: VideoParams,
     stop_at: str = "video",
     voice_preview: dict | None = None,
+    shengsuanyun_video_request: (
+        shengsuanyun_video.ShengsuanConfirmedVideoRequest | None
+    ) = None,
 ):
     """执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。"""
     try:
@@ -1287,6 +1364,7 @@ def start(
             params,
             stop_at=stop_at,
             voice_preview=voice_preview,
+            shengsuanyun_video_request=shengsuanyun_video_request,
         )
     except Exception as exc:
         logger.exception(

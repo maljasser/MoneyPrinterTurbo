@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import webbrowser
 from collections.abc import Mapping
 from datetime import datetime
@@ -42,7 +43,15 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
-from app.services import cache_manager, llm, video, voice, webui_task
+from app.services import (
+    cache_manager,
+    llm,
+    loomloom,
+    shengsuanyun_video,
+    video,
+    voice,
+    webui_task,
+)
 from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
@@ -88,6 +97,7 @@ ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
 VOICE_MODE_TTS = "tts"
 VOICE_MODE_UPLOAD = "upload"
 VOICE_MODE_NONE = "none"
+LOOMLOOM_MAX_POLL_FAILURES = 5
 # “默认”是 WebUI 专用哨兵，不会写入 config.toml，也不会传给 FFmpeg。
 # 后端在 video_codec 未配置时继续采用稳定的 libx264；单独保留该哨兵可以区分
 # “跟随项目默认策略”和“用户明确固定 libx264”，便于未来安全调整默认策略。
@@ -329,6 +339,34 @@ def _initialize_session_state():
         # 最近一次从当前页面提交的任务。生成改为后台执行后，页面 Fragment
         # 通过这个 ID 查询状态；刷新时不再依赖正在执行的旧页面脚本。
         "current_generation_task_id": "",
+        # LoomLoom 询价与执行必须跨 Streamlit rerun 保留完全相同的输入和
+        # clientRequestId，避免网络重试产生重复付费任务。
+        "loomloom_script_batch": None,
+        "loomloom_script_quote": None,
+        "loomloom_script_input_signature": "",
+        "loomloom_client_request_id": "",
+        "loomloom_run_id": "",
+        "loomloom_run_status": "",
+        "loomloom_run_error": "",
+        "loomloom_poll_failure_count": 0,
+        "loomloom_poll_retry_after": 0.0,
+        "loomloom_poll_paused": False,
+        "loomloom_script_candidates": (),
+        "loomloom_candidate_errors": (),
+        "loomloom_selected_candidate": 0,
+        "shengsuanyun_video_model": str(
+            config.app.get(
+                "shengsuanyun_video_model",
+                shengsuanyun_video.DEFAULT_MODEL_ID,
+            )
+        ),
+        "shengsuanyun_video_confirm_charge": False,
+        "shengsuanyun_video_confirmed_signature": "",
+        "shengsuanyun_video_rendered_signature": "",
+        "shengsuanyun_video_submitted_task_id": "",
+        "shengsuanyun_video_reset_pending": False,
+        # AI 视频按素材段计费，默认只生成一段，用户确认效果后再主动增加数量。
+        "shengsuanyun_video_scene_count": 1,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -336,10 +374,23 @@ def _initialize_session_state():
 
 _initialize_session_state()
 
+# Streamlit 禁止在控件本轮实例化后修改同名 session_state。后台任务可能在页面
+# 底部渲染时刚好结束，因此结束回调只登记清理请求；下一次整页渲染开始、任何
+# 控件创建之前再应用，既能清空付费确认，也不会触发状态生命周期异常。
+if st.session_state.pop("shengsuanyun_video_reset_pending", False):
+    st.session_state["shengsuanyun_video_confirm_charge"] = False
+    st.session_state["shengsuanyun_video_confirmed_signature"] = ""
+    st.session_state["shengsuanyun_video_submitted_task_id"] = ""
+
 
 def tr(key):
     loc = locales.get(st.session_state["ui_language"], {})
-    return loc.get("Translation", {}).get(key, key)
+    value = loc.get("Translation", {}).get(key)
+    if value is not None:
+        return value
+    # 新功能优先维护中英文。其它语言缺少单项翻译时统一回退英文，避免在多个
+    # locale 中复制相同英文后长期失去同步；英文也没有该键时才显示原始 key。
+    return locales.get("en", {}).get("Translation", {}).get(key, key)
 
 
 # -----------------------------------------------------------------------------
@@ -1548,7 +1599,14 @@ def _render_current_generation_task():
 
     state = _normalize_task_state((task or {}).get("state"))
     if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
+        was_active = task_id in _active_generation_tasks()
         _remove_active_generation_task(task_id)
+        if st.session_state.get("shengsuanyun_video_submitted_task_id") == task_id:
+            # Router 直连任务没有幂等提交键。无论成功还是失败，下一次生成都要
+            # 重新确认付费，避免用户误把一次确认用于多次远端请求。
+            _reset_shengsuanyun_video_confirmation()
+            if was_active:
+                st.rerun(scope="app")
         _render_generation_task_snapshot(task_id, task)
         return
 
@@ -2205,6 +2263,596 @@ def _render_settings_dialog():
 # -----------------------------------------------------------------------------
 
 
+def _create_loomloom_script_backend():
+    """从当前 WebUI/config.toml 配置创建批量文案客户端。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    settings = loomloom.LoomLoomSettings.from_mapping(app_config_snapshot)
+    return loomloom.LoomLoomScriptBackend(settings)
+
+
+def _create_shengsuanyun_video_backend():
+    """从当前 WebUI/config.toml 配置创建胜算云视频客户端。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    settings = shengsuanyun_video.ShengsuanVideoSettings.from_mapping(
+        app_config_snapshot
+    )
+    return shengsuanyun_video.ShengsuanVideoBackend(settings)
+
+
+def _effective_loomloom_api_token():
+    """读取 WebUI 尚未落盘或 config.toml 中的胜算云 API Key。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    return loomloom.resolve_api_token(app_config_snapshot)
+
+
+def _effective_script_generation_backend():
+    """读取包含 WebUI 待保存修改的文案生成方式。"""
+    app_config_snapshot = config.snapshot_config_with_pending(config.app)
+    backend = str(
+        app_config_snapshot.get("script_generation_backend", "local") or "local"
+    ).strip()
+    return backend if backend in {"local", "loomloom"} else "local"
+
+
+def _render_loomloom_api_token_input():
+    """复用胜算云密钥输入，并与其它 Provider 一样保存到 config.toml。"""
+    configured_token = loomloom.resolve_api_token(
+        config.snapshot_config_with_pending(config.app)
+    )
+    st.session_state.setdefault("loomloom_user_api_token", configured_token)
+    api_token = st.text_input(
+        tr("Shengsuan Cloud API Key"),
+        type="password",
+        key="loomloom_user_api_token",
+        help=tr("Shengsuan Cloud API Key Help"),
+        placeholder=tr("Shengsuan Cloud API Key Placeholder"),
+    ).strip()
+    _set_runtime_config("app", "loomloom_api_token", api_token)
+    return _effective_loomloom_api_token()
+
+
+def _shengsuanyun_video_scene_prompts(video_terms, subject, scene_count):
+    """按素材关键词生成有限数量的场景描述，供视频模型逐段生成素材。"""
+    if isinstance(video_terms, str):
+        terms = [
+            term.strip() for term in re.split(r"[,，\n]", video_terms) if term.strip()
+        ]
+    elif isinstance(video_terms, list):
+        terms = [
+            str(term or "").strip() for term in video_terms if str(term or "").strip()
+        ]
+    else:
+        terms = []
+    fallback = str(subject or "").strip()
+    if not terms and fallback:
+        terms = [fallback]
+    if not terms:
+        return ()
+    return tuple(
+        (
+            terms[index % len(terms)]
+            if index < len(terms)
+            else f"{terms[index % len(terms)]}; alternative camera angle {index + 1}"
+        )
+        for index in range(int(scene_count))
+    )
+
+
+def _shengsuanyun_video_signature(batch, credential_fingerprint):
+    """标记一次付费确认所覆盖的完整请求参数。"""
+    payload = {
+        "modelId": batch.model_id,
+        "prompts": list(batch.prompts),
+        "aspectRatio": batch.aspect_ratio,
+        "credentialFingerprint": str(credential_fingerprint or "").strip(),
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _current_shengsuanyun_video_context(params):
+    """根据当前页面参数构建直接提交给胜算云的视频批次。"""
+    token = _effective_loomloom_api_token()
+    scene_count = int(st.session_state.get("shengsuanyun_video_scene_count", 1) or 1)
+    prompts = _shengsuanyun_video_scene_prompts(
+        params.video_terms,
+        params.video_subject or params.video_script,
+        scene_count,
+    )
+    if not token or not prompts:
+        return None, ""
+    try:
+        batch = _create_shengsuanyun_video_backend().prepare_batch(
+            subject=params.video_subject or params.video_script,
+            scene_prompts=prompts,
+            aspect_ratio=str(
+                params.video_aspect.value
+                if isinstance(params.video_aspect, VideoAspect)
+                else params.video_aspect
+            ),
+            model_id=st.session_state.get(
+                "shengsuanyun_video_model",
+                shengsuanyun_video.DEFAULT_MODEL_ID,
+            ),
+        )
+    except (shengsuanyun_video.ShengsuanVideoError, ValueError):
+        return None, ""
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return batch, _shengsuanyun_video_signature(batch, fingerprint)
+
+
+def _render_shengsuanyun_video_settings(params):
+    """渲染胜算云模型、素材数量和付费确认，不在 UI 散落模型参数。"""
+    st.caption(tr("Shengsuan Cloud AI Video Help"))
+    if _effective_script_generation_backend() != "loomloom":
+        _render_loomloom_api_token_input()
+
+    token = _effective_loomloom_api_token()
+    model_ids = [model.model_id for model in shengsuanyun_video.VIDEO_MODELS]
+    selected_model_id = stable_selectbox(
+        tr("Shengsuan Video Model"),
+        options=model_ids,
+        default_value=st.session_state.get(
+            "shengsuanyun_video_model",
+            shengsuanyun_video.DEFAULT_MODEL_ID,
+        ),
+        key="shengsuanyun_video_model_select",
+        format_func=lambda value: (
+            shengsuanyun_video.get_video_model(value).display_name
+        ),
+        help=tr("Shengsuan Video Model Help"),
+    )
+    st.session_state["shengsuanyun_video_model"] = selected_model_id
+    _set_runtime_config("app", "shengsuanyun_video_model", selected_model_id)
+    selected_model = shengsuanyun_video.get_video_model(selected_model_id)
+    st.caption(
+        tr("Shengsuan Video Model Summary").format(
+            duration=selected_model.duration_seconds,
+            resolution=selected_model.resolution,
+        )
+    )
+
+    st.number_input(
+        tr("AI Video Scene Count"),
+        min_value=1,
+        max_value=shengsuanyun_video.MAX_VIDEO_SCENES,
+        step=1,
+        key="shengsuanyun_video_scene_count",
+    )
+    batch, input_signature = _current_shengsuanyun_video_context(params)
+    if not token:
+        st.warning(tr("Shengsuan Cloud API Key Required"))
+    request_running = _shengsuanyun_video_request_is_running()
+    if request_running:
+        st.info(tr("AI Video Request Already Running"))
+
+    # 模型、场景、画幅、关键词或密钥任一变化后，旧确认都不再有效。单独记录
+    # 上一次渲染签名，可以区分“用户刚勾选”与“参数变化遗留的旧勾选”。
+    previous_signature = st.session_state.get(
+        "shengsuanyun_video_rendered_signature", ""
+    )
+    if previous_signature != input_signature:
+        st.session_state["shengsuanyun_video_confirm_charge"] = False
+        st.session_state["shengsuanyun_video_confirmed_signature"] = ""
+        st.session_state["shengsuanyun_video_rendered_signature"] = input_signature
+
+    confirmed = st.checkbox(
+        tr("Confirm AI Video Charge"),
+        key="shengsuanyun_video_confirm_charge",
+        help=tr("Confirm AI Video Charge Help"),
+        disabled=not token or batch is None or request_running,
+    )
+    st.session_state["shengsuanyun_video_confirmed_signature"] = (
+        input_signature if confirmed else ""
+    )
+
+
+def _reset_shengsuanyun_video_confirmation():
+    """登记付费确认清理，下一次渲染开始时再修改 checkbox 状态。"""
+    st.session_state["shengsuanyun_video_reset_pending"] = True
+    st.session_state["shengsuanyun_video_confirmed_signature"] = ""
+    st.session_state["shengsuanyun_video_submitted_task_id"] = ""
+
+
+def _shengsuanyun_video_request_is_running():
+    """判断当前付费请求是否已经关联到一个尚未结束的视频任务。"""
+    task_id = str(
+        st.session_state.get("shengsuanyun_video_submitted_task_id", "") or ""
+    ).strip()
+    if not task_id:
+        return False
+    if task_id in _active_generation_tasks():
+        return True
+    try:
+        task = sm.state.get_task(task_id)
+    except Exception as exc:
+        # 状态存储暂时不可用时不能假定付费任务已经结束，否则再次提交可能重复
+        # 计费。保守地保持禁用，待状态查询恢复后页面会自动解除。
+        logger.warning(
+            "failed to verify Shengsuan video task state: "
+            f"task_id={task_id}, error={exc}"
+        )
+        return True
+    state = _normalize_task_state((task or {}).get("state"))
+    if state != const.TASK_STATE_PROCESSING:
+        # Fragment 轮询可能尚未触发整页 rerun。这里在用户下一次操作前再次清理
+        # 已结束任务的确认状态，保证一个勾选不会被复用于第二次付费请求。
+        _reset_shengsuanyun_video_confirmation()
+        st.rerun(scope="app")
+    return True
+
+
+def _loomloom_script_signature(
+    *,
+    subject,
+    language,
+    candidate_count,
+    duration_seconds,
+    style,
+    credential_fingerprint,
+):
+    payload = {
+        "subject": str(subject or "").strip(),
+        "language": str(language or "auto").strip() or "auto",
+        "candidateCount": int(candidate_count),
+        "durationSeconds": int(duration_seconds),
+        "style": str(style or "").strip(),
+        "credentialFingerprint": str(credential_fingerprint or "").strip(),
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _render_local_script_generation(params):
+    """保留 MoneyPrinterTurbo 原有的本地 LLM 脚本生成路径。"""
+    if not st.button(
+        tr("Generate Video Script and Keywords"),
+        key="auto_generate_script",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/auto_awesome:",
+    ):
+        return
+
+    if not params.video_subject:
+        st.toast(tr("Please Enter the Video Subject First"))
+        st.warning(tr("Please Enter the Video Subject First"))
+        return
+
+    with st.spinner(tr("Generating Video Script and Keywords")):
+
+        def generate_script_and_terms(app_config_snapshot):
+            script = llm.generate_script(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+                app_config=app_config_snapshot,
+            )
+            terms = llm.generate_terms(
+                params.video_subject,
+                script,
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+                app_config=app_config_snapshot,
+            )
+            return script, terms
+
+        script, terms = _run_llm_read_operation(
+            "generate_script_and_terms",
+            generate_script_and_terms,
+        )
+        if "Error: " in script:
+            st.error(tr(script))
+        elif "Error: " in terms:
+            st.error(tr(terms))
+        else:
+            st.session_state["video_script"] = script
+            st.session_state["video_terms"] = ", ".join(terms)
+
+
+def _render_loomloom_candidates():
+    candidates = tuple(st.session_state.get("loomloom_script_candidates") or ())
+    errors = tuple(st.session_state.get("loomloom_candidate_errors") or ())
+    if errors:
+        st.warning(
+            tr("LoomLoom Candidate Errors").format(
+                count=len(errors),
+                details="; ".join(
+                    f"#{error.row_index + 1}: {error.message}" for error in errors
+                ),
+            )
+        )
+    if not candidates:
+        return
+
+    selected_index = st.radio(
+        tr("Choose Script Candidate"),
+        options=list(range(len(candidates))),
+        key="loomloom_selected_candidate",
+        format_func=lambda index: (
+            f"#{candidates[index].row_index + 1} {candidates[index].script[:80]}"
+        ),
+    )
+    selected = candidates[selected_index]
+    st.code(selected.script, language=None, wrap_lines=True)
+    st.caption(", ".join(selected.video_terms))
+    if st.button(
+        tr("Use Selected Candidate"),
+        key="loomloom_apply_candidate",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["video_script"] = selected.script
+        st.session_state["video_terms"] = ", ".join(selected.video_terms)
+        st.toast(tr("LoomLoom Candidate Applied"))
+
+
+def _handle_loomloom_poll_error(run_id, exc):
+    """对脚本任务轮询错误做有限退避，确定性错误立即停止轮询。"""
+    logger.warning(f"failed to poll LoomLoom run: run_id={run_id}, error={exc}")
+    failure_count = int(st.session_state.get("loomloom_poll_failure_count", 0) or 0) + 1
+    retryable = isinstance(exc, loomloom.LoomLoomAPIError) and exc.retryable
+    if not retryable or failure_count >= LOOMLOOM_MAX_POLL_FAILURES:
+        st.session_state["loomloom_run_error"] = str(exc)
+        st.session_state["loomloom_poll_failure_count"] = 0
+        st.session_state["loomloom_poll_retry_after"] = 0.0
+        # 查询失败不等于远端付费任务失败。保留 run_id 并暂停自动轮询，让用户
+        # 可以继续查询同一个任务；如果直接丢弃 ID 后重新提交，可能重复付费。
+        st.session_state["loomloom_poll_paused"] = True
+        st.rerun(scope="app")
+        return
+
+    retry_delay = min(2**failure_count, 30)
+    st.session_state["loomloom_poll_failure_count"] = failure_count
+    st.session_state["loomloom_poll_retry_after"] = time.monotonic() + retry_delay
+    st.warning(
+        tr("LoomLoom Poll Retry Warning").format(
+            attempt=failure_count,
+            max_attempts=LOOMLOOM_MAX_POLL_FAILURES,
+        )
+    )
+
+
+@st.fragment(run_every="2s")
+def _render_loomloom_run_progress():
+    run_id = str(st.session_state.get("loomloom_run_id", "") or "").strip()
+    if not run_id or st.session_state.get("loomloom_poll_paused", False):
+        return
+    retry_after = float(st.session_state.get("loomloom_poll_retry_after", 0.0) or 0.0)
+    retry_wait_seconds = max(0, int(math.ceil(retry_after - time.monotonic())))
+    if retry_wait_seconds > 0:
+        st.info(
+            tr("LoomLoom Poll Retry Pending").format(
+                seconds=retry_wait_seconds,
+            )
+        )
+        return
+    try:
+        backend = _create_loomloom_script_backend()
+        run = backend.get_run(run_id)
+    except loomloom.LoomLoomError as exc:
+        _handle_loomloom_poll_error(run_id, exc)
+        return
+
+    st.session_state["loomloom_run_status"] = run.status
+    if run.status == "completed":
+        try:
+            result = backend.get_script_results(run_id)
+        except loomloom.LoomLoomError as exc:
+            _handle_loomloom_poll_error(run_id, exc)
+            return
+        st.session_state["loomloom_poll_failure_count"] = 0
+        st.session_state["loomloom_poll_retry_after"] = 0.0
+        st.session_state["loomloom_poll_paused"] = False
+        st.session_state["loomloom_script_candidates"] = result.candidates
+        st.session_state["loomloom_candidate_errors"] = result.errors
+        st.session_state["loomloom_selected_candidate"] = 0
+        st.session_state["loomloom_run_id"] = ""
+        st.rerun(scope="app")
+        return
+    if run.status in {"failed", "cancelled", "canceled"}:
+        st.session_state["loomloom_run_error"] = run.first_error_message or run.status
+        st.session_state["loomloom_run_id"] = ""
+        st.session_state["loomloom_poll_paused"] = False
+        st.rerun(scope="app")
+        return
+
+    st.session_state["loomloom_poll_failure_count"] = 0
+    st.session_state["loomloom_poll_retry_after"] = 0.0
+    st.info(
+        tr("LoomLoom Run Progress").format(
+            completed=run.completed_tasks,
+            total=run.total_tasks,
+        )
+    )
+
+
+def _render_loomloom_script_generation(params):
+    st.caption(tr("LoomLoom Batch Script Generation Help"))
+    effective_token = _render_loomloom_api_token_input()
+    if not effective_token:
+        st.warning(tr("Shengsuan Cloud API Key Required"))
+
+    candidate_col, duration_col = st.columns(2)
+    candidate_count = candidate_col.number_input(
+        tr("Script Candidate Count"),
+        min_value=1,
+        max_value=loomloom.MAX_SCRIPT_CANDIDATES,
+        value=3,
+        step=1,
+        key="loomloom_candidate_count",
+    )
+    duration_seconds = duration_col.number_input(
+        tr("Target Script Duration Seconds"),
+        min_value=10,
+        max_value=600,
+        value=60,
+        step=10,
+        key="loomloom_script_duration_seconds",
+    )
+    input_signature = _loomloom_script_signature(
+        subject=params.video_subject,
+        language=params.video_language,
+        candidate_count=candidate_count,
+        duration_seconds=duration_seconds,
+        style=params.video_script_prompt,
+        credential_fingerprint=(
+            hashlib.sha256(effective_token.encode("utf-8")).hexdigest()
+            if effective_token
+            else ""
+        ),
+    )
+
+    if st.button(
+        tr("Get LoomLoom Quote"),
+        key="loomloom_quote_scripts",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/request_quote:",
+        disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
+    ):
+        if not params.video_subject:
+            st.toast(tr("Please Enter the Video Subject First"))
+            st.warning(tr("Please Enter the Video Subject First"))
+        else:
+            try:
+                backend = _create_loomloom_script_backend()
+                batch = backend.prepare_script_batch(
+                    subject=params.video_subject,
+                    candidate_count=int(candidate_count),
+                    language=params.video_language,
+                    duration_seconds=int(duration_seconds),
+                    style=params.video_script_prompt,
+                )
+                quote_result = backend.quote(batch)
+            except (loomloom.LoomLoomError, ValueError) as exc:
+                logger.warning(f"failed to quote LoomLoom scripts: error={exc}")
+                st.error(str(exc))
+            else:
+                st.session_state["loomloom_script_batch"] = batch
+                st.session_state["loomloom_script_quote"] = quote_result
+                st.session_state["loomloom_script_input_signature"] = input_signature
+                st.session_state["loomloom_client_request_id"] = f"mpt-{uuid4()}"
+                st.session_state["loomloom_run_id"] = ""
+                st.session_state["loomloom_run_status"] = "quoted"
+                st.session_state["loomloom_run_error"] = ""
+                st.session_state["loomloom_poll_failure_count"] = 0
+                st.session_state["loomloom_poll_retry_after"] = 0.0
+                st.session_state["loomloom_poll_paused"] = False
+                st.session_state["loomloom_script_candidates"] = ()
+                st.session_state["loomloom_candidate_errors"] = ()
+                st.session_state["loomloom_confirm_charge"] = False
+                logger.info(
+                    "LoomLoom script quote ready: "
+                    f"tasks={quote_result.task_count}, currency={quote_result.currency}, "
+                    f"estimated_payable_t={quote_result.estimated_buyer_payable_t}"
+                )
+
+    quote_result = st.session_state.get("loomloom_script_quote")
+    batch = st.session_state.get("loomloom_script_batch")
+    if quote_result is not None and batch is not None:
+        display_amount = (
+            quote_result.estimated_buyer_payable_amount
+            or f"{quote_result.estimated_buyer_payable_t} T"
+        )
+        st.success(
+            tr(
+                "LoomLoom Quote Summary Singular"
+                if quote_result.task_count == 1
+                else "LoomLoom Quote Summary"
+            ).format(
+                tasks=quote_result.task_count,
+                amount=display_amount,
+                currency=quote_result.currency,
+            )
+        )
+        quote_is_current = (
+            st.session_state.get("loomloom_script_input_signature") == input_signature
+        )
+        if not quote_is_current:
+            st.warning(tr("LoomLoom Quote Changed Warning"))
+        confirm_charge = st.checkbox(
+            tr("Confirm LoomLoom Charge"),
+            key="loomloom_confirm_charge",
+            disabled=not quote_is_current,
+        )
+        run_in_progress = bool(st.session_state.get("loomloom_run_id"))
+        if st.button(
+            tr("Run LoomLoom Batch"),
+            key="loomloom_execute_scripts",
+            use_container_width=True,
+            type="primary",
+            disabled=(not quote_is_current or not confirm_charge or run_in_progress),
+        ):
+            try:
+                execution = _create_loomloom_script_backend().execute(
+                    batch,
+                    client_request_id=st.session_state["loomloom_client_request_id"],
+                    listing_version_id=quote_result.listing_version_id,
+                    confirm=True,
+                )
+            except (loomloom.LoomLoomError, ValueError) as exc:
+                logger.warning(f"failed to execute LoomLoom scripts: error={exc}")
+                st.error(str(exc))
+            else:
+                st.session_state["loomloom_run_id"] = execution.run_id
+                st.session_state["loomloom_run_status"] = "running"
+                st.session_state["loomloom_poll_paused"] = False
+                # 一次报价只允许启动一次付费批次。后台状态只依赖 run_id，提交
+                # 后即可丢弃报价与幂等请求 ID；失败后用户需要重新报价再重试。
+                st.session_state["loomloom_script_batch"] = None
+                st.session_state["loomloom_script_quote"] = None
+                st.session_state["loomloom_script_input_signature"] = ""
+                st.session_state["loomloom_client_request_id"] = ""
+                logger.info(
+                    f"LoomLoom script run submitted: run_id={execution.run_id}, "
+                    f"tasks={len(batch.input_rows)}"
+                )
+                st.toast(tr("LoomLoom Run Submitted"))
+
+    run_error = str(st.session_state.get("loomloom_run_error", "") or "").strip()
+    if run_error:
+        st.error(tr("LoomLoom Run Failed").format(error=run_error))
+    run_id = str(st.session_state.get("loomloom_run_id", "") or "").strip()
+    if run_id and st.session_state.get("loomloom_poll_paused", False):
+        retry_col, stop_col = st.columns(2)
+        if retry_col.button(
+            tr("Resume LoomLoom Status Check"),
+            key="loomloom_resume_status_check",
+            use_container_width=True,
+            type="secondary",
+        ):
+            st.session_state["loomloom_run_error"] = ""
+            st.session_state["loomloom_poll_failure_count"] = 0
+            st.session_state["loomloom_poll_retry_after"] = 0.0
+            st.session_state["loomloom_poll_paused"] = False
+            st.rerun(scope="app")
+        if stop_col.button(
+            tr("Stop Tracking LoomLoom Run"),
+            key="loomloom_stop_tracking_run",
+            use_container_width=True,
+            type="secondary",
+            help=tr("Stop Tracking LoomLoom Run Help"),
+        ):
+            # 这里只停止本地状态查询，不声称取消远端执行。用户确认放弃跟踪后
+            # 才清理 run_id，下一次付费运行仍需重新报价和确认。
+            st.session_state["loomloom_run_id"] = ""
+            st.session_state["loomloom_run_error"] = ""
+            st.session_state["loomloom_poll_paused"] = False
+            st.rerun(scope="app")
+    # 只有真实运行中的批次才启动两秒轮询，报价阶段和结果展示阶段不创建
+    # 定时 fragment，避免用户停留在页面时产生无意义的网络请求和 rerun。
+    if run_id and not st.session_state.get("loomloom_poll_paused", False):
+        _render_loomloom_run_progress()
+    _render_loomloom_candidates()
+
+
 def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
     with panel:
@@ -2238,6 +2886,23 @@ def _render_script_settings(panel, params):
             # 同时避免样式误伤页面顶部的“基础设置”等其他折叠区域。
             with st.container(key="advanced_settings_script"):
                 with st.expander(tr("Advanced Script Settings"), expanded=False):
+                    script_backend_options = ["local", "loomloom"]
+                    script_backend_labels = {
+                        "local": tr("Local LLM Script Generation"),
+                        "loomloom": tr("Shengsuan Cloud Batch Script Generation"),
+                    }
+                    script_generation_backend = stable_selectbox(
+                        tr("Script Generation Method"),
+                        options=script_backend_options,
+                        default_value=_effective_script_generation_backend(),
+                        key="script_generation_backend_select",
+                        format_func=lambda value: script_backend_labels[value],
+                        help=tr("Script Generation Method Help"),
+                    )
+                    _set_runtime_config(
+                        "app", "script_generation_backend", script_generation_backend
+                    )
+
                     st.session_state.setdefault("paragraph_number_input", 1)
                     params.paragraph_number = st.slider(
                         tr("Script Paragraph Number"),
@@ -2292,56 +2957,22 @@ def _render_script_settings(panel, params):
                             )
                         )
 
-            if st.button(
-                tr("Generate Video Script and Keywords"),
-                key="auto_generate_script",
-                use_container_width=True,
-                type="secondary",
-                icon=":material/auto_awesome:",
-            ):
-                if not params.video_subject:
-                    # 视频主题是脚本生成的必要输入，提前拦截可以避免无意义的模型调用。
-                    st.toast(tr("Please Enter the Video Subject First"))
-                    st.warning(tr("Please Enter the Video Subject First"))
-                else:
-                    with st.spinner(tr("Generating Video Script and Keywords")):
-
-                        def generate_script_and_terms(app_config_snapshot):
-                            script = llm.generate_script(
-                                video_subject=params.video_subject,
-                                language=params.video_language,
-                                paragraph_number=params.paragraph_number,
-                                video_script_prompt=params.video_script_prompt,
-                                custom_system_prompt=params.custom_system_prompt,
-                                app_config=app_config_snapshot,
-                            )
-                            terms = llm.generate_terms(
-                                params.video_subject,
-                                script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
-                                app_config=app_config_snapshot,
-                            )
-                            return script, terms
-
-                        script, terms = _run_llm_read_operation(
-                            "generate_script_and_terms",
-                            generate_script_and_terms,
-                        )
-                        if "Error: " in script:
-                            st.error(tr(script))
-                        elif "Error: " in terms:
-                            st.error(tr(terms))
-                        else:
-                            st.session_state["video_script"] = script
-                            st.session_state["video_terms"] = ", ".join(terms)
+            if _effective_script_generation_backend() == "loomloom":
+                _render_loomloom_script_generation(params)
+            else:
+                _render_local_script_generation(params)
             params.video_script = st.text_area(
                 tr("Video Script"),
                 help=tr("Video Script Help"),
                 height=180,
                 key="video_script",
             )
-            if st.button(
+            using_loomloom_scripts = (
+                _effective_script_generation_backend() == "loomloom"
+            )
+            if using_loomloom_scripts:
+                st.caption(tr("LoomLoom Video Terms Reuse Help"))
+            elif st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
                 use_container_width=True,
@@ -2390,6 +3021,7 @@ def _render_video_settings(panel, params):
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
+                (tr("Shengsuan Cloud AI Video"), "loomloom"),
                 (tr("Local file"), "local"),
             ]
 
@@ -2554,6 +3186,9 @@ def _render_video_settings(panel, params):
                 _delete_runtime_config("app", "video_codec")
             else:
                 _set_runtime_config("app", "video_codec", selected_video_codec)
+
+            if params.video_source == "loomloom":
+                _render_shengsuanyun_video_settings(params)
     return uploaded_files
 
 
@@ -2961,9 +3596,7 @@ def _sync_minimax_tts_api_key_input():
     widget_key = "minimax_tts_api_key_input"
     configured_key = str(config.minimax_tts.get("api_key", "") or "").strip()
     shared_key = str(
-        config.app.get("minimax_api_key", "")
-        or os.getenv("MINIMAX_API_KEY", "")
-        or ""
+        config.app.get("minimax_api_key", "") or os.getenv("MINIMAX_API_KEY", "") or ""
     ).strip()
     effective_key = configured_key or shared_key
     had_widget_state = widget_key in st.session_state
@@ -3031,7 +3664,9 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
     if dedicated_key:
         _set_runtime_config("minimax_tts", "base_url", minimax_tts_base_url)
 
-    configured_model = config.minimax_tts.get("model_id", voice.MINIMAX_TTS_DEFAULT_MODEL)
+    configured_model = config.minimax_tts.get(
+        "model_id", voice.MINIMAX_TTS_DEFAULT_MODEL
+    )
     if configured_model not in voice.MINIMAX_TTS_MODELS:
         configured_model = voice.MINIMAX_TTS_DEFAULT_MODEL
     minimax_tts_model = stable_selectbox(
@@ -3065,9 +3700,7 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
                 minimax_tts_base_url,
                 available_voices,
             )
-            st.success(
-                tr("MiniMax Voices Loaded").format(count=len(available_voices))
-            )
+            st.success(tr("MiniMax Voices Loaded").format(count=len(available_voices)))
 
     available_voices = _get_cached_minimax_voices(
         effective_api_key,
@@ -3441,9 +4074,7 @@ def _render_audio_settings(panel, params):
             minimax_voices = []
             minimax_voice_labels = {}
             if tts_mode_enabled and selected_tts_server == "minimax-tts":
-                minimax_voices, minimax_voice_labels = (
-                    _render_minimax_tts_settings()
-                )
+                minimax_voices, minimax_voice_labels = _render_minimax_tts_settings()
 
             # 根据选择的TTS服务器获取声音列表
             filtered_voices = []
@@ -4089,7 +4720,13 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+        if params.video_source not in [
+            "pexels",
+            "pixabay",
+            "coverr",
+            "loomloom",
+            "local",
+        ]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
@@ -4114,6 +4751,39 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Please Enter the Coverr API Key"))
             st.stop()
+
+        shengsuanyun_video_request = None
+        if params.video_source == "loomloom":
+            if _shengsuanyun_video_request_is_running():
+                _remove_active_generation_task(task_id)
+                st.error(tr("AI Video Request Already Running"))
+                st.stop()
+            current_batch, current_signature = _current_shengsuanyun_video_context(
+                params
+            )
+            request_is_confirmed = bool(
+                current_batch is not None
+                and st.session_state.get("shengsuanyun_video_confirmed_signature")
+                == current_signature
+            )
+            if not request_is_confirmed or not st.session_state.get(
+                "shengsuanyun_video_confirm_charge", False
+            ):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Confirm AI Video Charge Required"))
+                st.stop()
+            try:
+                video_backend = _create_shengsuanyun_video_backend()
+                shengsuanyun_video_request = (
+                    shengsuanyun_video.ShengsuanConfirmedVideoRequest(
+                        settings=video_backend.settings, batch=current_batch
+                    )
+                )
+                shengsuanyun_video_request.validate()
+            except (shengsuanyun_video.ShengsuanVideoError, ValueError) as exc:
+                _remove_active_generation_task(task_id)
+                st.error(str(exc))
+                st.stop()
 
         if (
             params.bgm_type == "sonilo"
@@ -4270,7 +4940,12 @@ def _render_generation_controls(
                 params=params,
                 capture_logs=not config.ui.get("hide_log", False),
                 voice_preview=reusable_voice_preview,
+                shengsuanyun_video_request=shengsuanyun_video_request,
             )
+            if shengsuanyun_video_request is not None:
+                # 直连任务没有幂等提交键，运行期间必须阻止重复提交，任务结束后
+                # 再清除付费确认，确保下一次请求由用户主动确认。
+                st.session_state["shengsuanyun_video_submitted_task_id"] = task_id
         except Exception:
             _remove_active_generation_task(task_id)
             st.error(tr("Video Generation Failed"))
