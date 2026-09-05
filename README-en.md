@@ -276,6 +276,13 @@ Use the local setup or Docker instructions below.
 
 ## Installation & Deployment 📥
 
+For a private cloud instance with a password-protected WebUI/API and persistent
+storage, see the [Arabic cloud deployment guide](docs/PRIVATE-CLOUD-AR.md).
+This uses `deploy/Dockerfile`; external AI and media services still require your
+own provider credentials.
+For on-demand private browser access through your GitHub account, use the
+[Codespaces guide](docs/CODESPACES-AR.md) and the included dev container setup.
+
 ### Prerequisites
 
 - Local deployment requires Python 3.11 or later
