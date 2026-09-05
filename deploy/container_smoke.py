@@ -66,12 +66,14 @@ def main():
         execute("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
                 "-i", "testsrc2=size=1280x720:rate=24", "-t", "2", "-c:v", "libx264",
                 "-pix_fmt", "yuv420p", "/data/storage/smoke-input.mp4")
-        output = json.loads(execute(
+        cli_output = execute(
             "python", "cli.py", "--video-script", "اختبار الفيديو",
             "--video-source", "local", "--video-materials", "/data/storage/smoke-input.mp4",
             "--voice-name", "no-voice", "--subtitle-enabled", "--font-name", "NotoNaskhArabic-Regular.ttf",
             "--video-aspect", "16:9", "--bgm-type", "random", "--n-threads", "2",
-        ))["result"]
+        )
+        # The CLI writes terminal logs before its final one-line JSON result.
+        output = json.loads(cli_output.splitlines()[-1])["result"]
         assert output["videos"], output
         media = json.loads(execute("ffprobe", "-v", "error", "-show_streams", "-of", "json", output["videos"][0]))
         assert {stream["codec_type"] for stream in media["streams"]} >= {"audio", "video"}
