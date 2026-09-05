@@ -40,5 +40,6 @@ streamlit.log
 coverage.xml
 htmlcov/
 .codegraph
+/resource/fonts/NotoNaskhArabic-Regular.ttf
 /docs/superpowers
 .understand-anything

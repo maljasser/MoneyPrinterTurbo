@@ -13,7 +13,9 @@ from loguru import logger
 from app import __version__
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-config_file = f"{root_dir}/config.toml"
+config_file = os.path.abspath(
+    os.environ.get("MPT_CONFIG_FILE") or f"{root_dir}/config.toml"
+)
 _CONTAINER_CGROUP_MARKERS = ("docker", "containerd", "kubepods", "libpod", "podman")
 _DOCKER_HOST_GATEWAY_NAME = "host.docker.internal"
 _config_save_lock = threading.RLock()
@@ -458,9 +460,11 @@ def _load_toml_config(config_path: str):
 
 
 def load_config():
-    # fix: IsADirectoryError: [Errno 21] Is a directory: '/MoneyPrinterTurbo/config.toml'
+    # A mounted directory must never be deleted while loading configuration.
     if os.path.isdir(config_file):
-        shutil.rmtree(config_file)
+        raise IsADirectoryError(f"Expected a TOML file, found a directory: {config_file}")
+
+    os.makedirs(os.path.dirname(config_file), exist_ok=True)
 
     if not os.path.isfile(config_file):
         example_file = f"{root_dir}/config.example.toml"
@@ -517,7 +521,7 @@ def save_config():
             fd, temp_path = tempfile.mkstemp(
                 prefix=".config-",
                 suffix=".toml.tmp",
-                dir=root_dir,
+                dir=os.path.dirname(os.path.abspath(config_file)),
             )
             with os.fdopen(fd, mode="w", encoding="utf-8") as f:
                 f.write(serialized_config)

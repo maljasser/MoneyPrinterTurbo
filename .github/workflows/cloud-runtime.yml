@@ -1,0 +1,25 @@
+name: Private cloud runtime
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/**'
+      - 'app/config/config.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/cloud-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the complete CPU runtime
+        run: docker build -f deploy/Dockerfile -t mpt-cloud .
+      - name: Verify authentication, API, WebUI, rendering and restart persistence
+        run: python deploy/container_smoke.py

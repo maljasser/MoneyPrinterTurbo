@@ -1,0 +1,13 @@
+{
+  "name": "MoneyPrinterTurbo",
+  "hostRequirements": {"cpus": 4, "memory": "8gb"},
+  "forwardPorts": [8501, 8080],
+  "portsAttributes": {
+    "8501": {"label": "MoneyPrinterTurbo", "onAutoForward": "openBrowser"},
+    "8080": {"label": "MoneyPrinterTurbo API", "onAutoForward": "silent"}
+  },
+  "otherPortsAttributes": {"onAutoForward": "ignore"},
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "customizations": {"codespaces": {"openFiles": ["docs/CODESPACES-AR.md"]}}
+}

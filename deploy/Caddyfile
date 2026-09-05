@@ -1,0 +1,24 @@
+{
+	admin off
+	auto_https off
+}
+
+:{$PORT:8080} {
+	# The only unauthenticated endpoint returns a fixed readiness result.
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8090
+	}
+
+	handle {
+		basic_auth {
+			{$MPT_AUTH_USER} {$MPT_AUTH_PASSWORD_HASH}
+		}
+		@api path /api /api/* /tasks /tasks/* /docs /docs/* /redoc /openapi.json /ping
+		handle @api {
+			reverse_proxy 127.0.0.1:8081
+		}
+		handle {
+			reverse_proxy 127.0.0.1:8501
+		}
+	}
+}
