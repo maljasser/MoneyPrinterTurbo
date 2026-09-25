@@ -4,14 +4,14 @@
 
 ## البدء
 
-1. جهّز تشغيل المشروع في [Codespaces](../docs/CODESPACES-AR.md) أو في حاوية Docker الخاصة، وضع إعدادات الخدمات في `config.toml` (أو في `MPT_CONFIG_FILE`). يجب أن يبقى `upload_post_auto_upload = false` في قسم `[app]`.
+1. جهّز تشغيل المشروع في [Codespaces](../docs/CODESPACES-AR.md) على الفرع الذي يحتوي على هذا المسار، أو في حاوية Docker الخاصة. ضع إعدادات الخدمات في `config.toml` (أو في `MPT_CONFIG_FILE`). يجب أن يبقى `upload_post_auto_upload = false` في قسم `[app]`.
 2. انسخ [مثال الحلقة الثانية](episodes/ep02.sample.json) إلى ملف عمل خاص بك. استخدم مثال اجتماع **افتراضي** وخطوات شاشة حقيقية من إنتاجك، من دون بيانات عمل حساسة. ضع مقطعي العرض عند المسارين المحددين في `materials`، أو عدّل المسارات إلى ملفاتك الأصلية. ابدأ بلقطة النتيجة ثم اعرض الانتقال من الملاحظات إلى القرارات والمهام. لا يكفي مشهد عام عن اجتماع لإثبات الخطوات.
 3. راجع صحة النص، التسلسل، ادعاءات الأداة، المقاطع، والحقوق. غيّر `status` من `draft` إلى `approved` بعد اعتماد المحتوى للإنتاج؛ هذا الاعتماد لا يجيز النشر.
 4. شغّل من جذر المستودع:
 
    ```bash
-   python fiknova/pipeline.py plan fiknova/episodes/ep02.sample.json
-   python fiknova/pipeline.py render fiknova/episodes/ep02.sample.json
+   uv run --no-sync python fiknova/pipeline.py plan fiknova/episodes/ep02.sample.json
+   uv run --no-sync python fiknova/pipeline.py render fiknova/episodes/ep02.sample.json
    ```
 
 `plan` يعرض المواد والخط والإعدادات الناقصة. `render` يستخدم CLI المشروع لتكوين الصوت السعودي والترجمة العربية والفيديو العمودي `9:16` ثم يحفظ `review.json` و`render.log` داخل `storage/fiknova/<id>/`. تُحفظ ملفات MP4 النهائية في `storage/tasks/<task_id>/`؛ تجد مسارها في `review.json`.
