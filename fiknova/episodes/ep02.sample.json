@@ -1,0 +1,17 @@
+{
+  "id": "ep02-meeting-decisions",
+  "status": "draft",
+  "aspect": "9:16",
+  "title_ar": "حوّل ملاحظات الاجتماع إلى قرارات ومهام باستخدام AI",
+  "description_ar": "تجربة عملية لتحويل ملاحظات اجتماع افتراضي إلى قرارات، مهام بمسؤوليات واضحة، ونقاط تحتاج إلى تحقق. Fiknova — من الفكرة إلى القيمة.",
+  "script_ar": "انتهى الاجتماع ومعك صفحة كاملة من الملاحظات. كيف تعرف ما الذي تقرر فعلًا؟ في هذا المثال الافتراضي، أعطي الذكاء الاصطناعي ملاحظات مبعثرة، ثم أطلب منه ثلاثة مخرجات فقط: القرارات الصريحة، والمهام مع المسؤول والموعد، والأسئلة التي لم تُحسم. لاحظ هنا: الأداة اقترحت موعدًا لم يرد في الملاحظات. نحذفه ونضعه ضمن العناصر المطلوب تأكيدها. هكذا تحصل على مسودة قابلة للمراجعة خلال دقائق. راجعها مع الفريق قبل اعتمادها أو إرسالها. أي خطوة في اجتماعاتك تستغرق منك وقتًا أطول؟",
+  "title_en": "Turn meeting notes into decisions and actions with AI",
+  "description_en": "A practical fictional example of extracting confirmed decisions, assigned actions, and open questions from meeting notes. Review the output before sharing it.",
+  "script_en": "The meeting is over and you have a page of notes. What was actually decided? In this fictional example, I give AI scattered notes and ask for just three outputs: explicit decisions, actions with an owner and due date, and unresolved questions. Notice this: the tool invented a due date. We remove it and list it as something to confirm. That gives us a draft in minutes. Review it with the team before approving or sending it. Which part of meetings takes you the longest?",
+  "materials": [
+    "../assets/ep02-notes-demo.mp4",
+    "../assets/ep02-output-demo.mp4"
+  ],
+  "voice_name": "ar-SA-HamedNeural",
+  "font_name": "NotoNaskhArabic-Regular.ttf"
+}

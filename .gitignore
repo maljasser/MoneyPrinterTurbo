@@ -41,5 +41,8 @@ coverage.xml
 htmlcov/
 .codegraph
 /resource/fonts/NotoNaskhArabic-Regular.ttf
+/fiknova/assets/
+/fiknova/episodes/*.json
+!/fiknova/episodes/*.sample.json
 /docs/superpowers
 .understand-anything
