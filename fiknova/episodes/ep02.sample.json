@@ -1,0 +1,18 @@
+{
+  "id": "ep02-meeting-decisions",
+  "status": "draft",
+  "aspect": "9:16",
+  "video_clip_duration": 64,
+  "title_ar": "حوّل ملاحظات الاجتماع إلى قرارات ومهام باستخدام AI",
+  "description_ar": "محاكاة تعليمية ببيانات اجتماع افتراضي: القرارات الصريحة، المهام، والعناصر التي تحتاج تحقق. ليست تسجيلًا لأداة فعلية. Fiknova — من الفكرة إلى القيمة.",
+  "script_ar": "من ملاحظات مبعثرة إلى قرار واضح ومهمتين وأربعة أسئلة للتحقق. هذه محاكاة تعليمية ببيانات افتراضية، وليست تسجيلًا لأداة فعلية. في الملاحظات، اتفق الفريق على تجربة النموذج مع خمسة مستخدمين. سارة ستجهز النموذج الأولي في الثاني والعشرين من أكتوبر، الساعة الثالثة مساء بتوقيت الرياض. عمر سيتولى مراجعة التكلفة، لكن موعده غير محدد. نطلب من AI القرارات الصريحة، والمهام مع المسؤول والموعد، والأسئلة المفتوحة، مع مصدر كل معلومة. الآن نعرض خطأ صممناه للتوضيح: إضافة الثالث والعشرين من أكتوبر موعدًا لعمر. هذا الموعد لم يرد في الملاحظات؛ نحذفه ونضعه ضمن نقاط التحقق. الميزانية وموعد الإطلاق واستخدام بيانات العملاء لم تحسم أيضًا. راجع المسودة مع الفريق قبل اعتمادها أو مشاركتها. أي خطوة في اجتماعاتك تستغرق منك وقتًا أطول؟",
+  "title_en": "Turn meeting notes into decisions and actions with AI",
+  "description_en": "Educational simulation with fictional meeting data, not a recording of a real tool. Extract explicit decisions, actions and unresolved questions; verify every item against the notes.",
+  "script_en": "From scattered notes to one explicit decision, two actions and four verification questions. This is an educational simulation with fictional data, not a recording of a real tool. The team agreed to test with five users. Sara will prepare the prototype by 22 October at 3 PM Riyadh time. Omar will review costs, but no deadline was given. Ask AI for explicit decisions, actions with owners and deadlines, and unresolved questions, citing each source note. Here is an error constructed for teaching: adding 23 October as Omar's deadline. It was not in the notes, so remove it and flag the deadline for confirmation. Budget, launch date and customer-data use also remain unresolved. Review with the team before approving or sharing. Which step in your meetings takes the longest?",
+  "materials": [
+    "../assets/ep02-notes-demo.mp4",
+    "../assets/ep02-output-demo.mp4"
+  ],
+  "voice_name": "ar-SA-HamedNeural",
+  "font_name": "NotoNaskhArabic-Regular.ttf"
+}

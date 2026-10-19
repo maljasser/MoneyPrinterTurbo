@@ -28,3 +28,6 @@ logs/
 
 storage/
 config.toml
+fiknova/assets/
+fiknova/episodes/*.json
+!fiknova/episodes/*.sample.json

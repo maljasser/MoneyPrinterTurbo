@@ -25,6 +25,7 @@ COPY app ./app
 COPY webui ./webui
 COPY resource ./resource
 COPY deploy ./deploy
+COPY fiknova ./fiknova
 COPY cli.py main.py config.example.toml ./
 RUN cp /usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf resource/fonts/ \
     && ln -s /data/storage storage \
