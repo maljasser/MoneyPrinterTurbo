@@ -1,0 +1,40 @@
+{
+  "id": "ep02-cinematic-review",
+  "status": "draft",
+  "fictional": true,
+  "aspect": "9:16",
+  "continuity_anchor": "Fictional Saudi workplace drama. Same modern Riyadh office meeting room, warm daylight from camera left, walnut table, frosted glass and teal details. Three original adults only: Noura, a Saudi woman in her late 30s, oval face, beige hijab and navy blazer, team lead; Sara, a Saudi woman in her early 30s, round face, gray hijab and black abaya, project analyst; Omar, a Saudi man in his mid 30s, short black beard, white thobe without headwear, finance analyst. Preserve identical faces, outfits, seating and voices across all shots. Natural professional Saudi Arabic delivery, no caricature. Eye-level 50mm documentary lens, subtle realistic camera movement. The conversation and all meeting data are fictional.",
+  "source_notes": "fiknova/ep02_meeting.sample.json",
+  "scenes": [
+    {
+      "id": "S01", "duration": 8,
+      "purpose_ar": "افتتاح بالمشكلة: موعد لم يتفق عليه الفريق",
+      "prompt": "After the meeting, medium two-shot of Noura and Omar, Sara visible beside a laptop. Noura looks at a draft summary and asks naturally: «عمر، مكتوب هنا تسلم مراجعة التكلفة يوم ثلاثة وعشرين أكتوبر؟» Omar calmly replies: «بس إحنا ما حددنا موعد.» End on Sara noticing the discrepancy. This is a constructed teaching error, not observed output from an actual AI tool."
+    },
+    {
+      "id": "S02", "duration": 12,
+      "purpose_ar": "استرجاع الاجتماع: قرار صريح والتزام محدد",
+      "prompt": "Flash back to the meeting earlier that day. Wide establishing shot then gentle push in on the same coworkers. Noura states: «اتفقنا نجرب النموذج مع خمسة مستخدمين قبل التوسع.» Sara replies: «وأجهز النموذج يوم اثنين وعشرين أكتوبر، الساعة ثلاث مساء بتوقيت الرياض.» Omar listens and writes a note. No other decision is made."
+    },
+    {
+      "id": "S03", "duration": 12,
+      "purpose_ar": "فصل الالتزام عن الموعد والمقترحات غير المعتمدة",
+      "prompt": "Continue the same earlier meeting, medium shot of Omar then Noura. Omar says: «أنا أتولى مراجعة التكلفة.» Noura adds: «وخمسين ألف للميزانية، وأول نوفمبر للإطلاق، هذي اقتراحات ما اعتمدناها.» No one gives Omar a deadline. Noura is proposing rather than approving the budget and launch date."
+    },
+    {
+      "id": "S04", "duration": 10,
+      "purpose_ar": "استخراج القرارات والمهام والأسئلة دون ادعاء تجربة أداة فعلية",
+      "prompt": "Back after the meeting. Over Sara's shoulder, a generic unbranded laptop screen is deliberately out of focus with no readable interface or invented logos. Sara tells Noura: «نطلب القرارات الصريحة، والمهام مع المسؤول والموعد، والأسئلة المفتوحة، ومع كل نقطة مصدرها.» She organizes notes. Do not present this as a screen recording or a test of a real product."
+    },
+    {
+      "id": "S05", "duration": 10,
+      "purpose_ar": "تصحيح الموعد غير المسند والإبقاء على الأسئلة المفتوحة",
+      "prompt": "Medium shot of Sara and Omar at the same laptop, Noura beside them. Sara says: «صحيح، موعد عمر مو موجود في الملاحظات. نحذف ثلاثة وعشرين أكتوبر ونكتب: الموعد غير محدد.» Omar nods and says: «ونحط تأكيد الموعد ضمن الأسئلة المفتوحة.» Sara removes an entry; the laptop remains out of focus and unbranded."
+    },
+    {
+      "id": "S06", "duration": 8,
+      "purpose_ar": "المراجعة البشرية قبل المشاركة",
+      "prompt": "Closing medium shot of Noura with the team. Noura says: «ونتأكد من الميزانية والإطلاق، وهل نستخدم بيانات العملاء. نراجع مع الفريق قبل المشاركة.» End with a natural thoughtful pause. No approval or publication occurs. Soft office ambience, no music."
+    }
+  ]
+}
