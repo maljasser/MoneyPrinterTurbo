@@ -48,6 +48,15 @@ class FiknovaPipelineTest(unittest.TestCase):
         self.assertFalse(pipeline.plan(self.episode_path)["render_ready"])
         with self.assertRaisesRegex(pipeline.EpisodeError, "approved"):
             pipeline.render(self.episode_path)
+        self.assertFalse((self.root / "storage").exists())
+
+    def test_clip_duration_rejects_invalid_values(self):
+        for value in (0, 121, True, "64", 8.5):
+            with self.subTest(value=value):
+                self.episode["video_clip_duration"] = value
+                self.save()
+                with self.assertRaisesRegex(pipeline.EpisodeError, "video_clip_duration"):
+                    pipeline.plan(self.episode_path)
 
     def test_auto_upload_setting_blocks_render(self):
         self.episode["status"] = "approved"
@@ -59,6 +68,7 @@ class FiknovaPipelineTest(unittest.TestCase):
 
     def test_successful_cli_result_creates_review_package(self):
         self.episode["status"] = "approved"
+        self.episode["video_clip_duration"] = 64
         self.save()
         fake_result = {"succeeded": 1, "failed": 0, "tasks": [
             {"task_id": "mock-id", "result": {"videos": ["/fake/clip.mp4"]}}
@@ -77,6 +87,12 @@ class FiknovaPipelineTest(unittest.TestCase):
         self.assertEqual(task["video_source"], "local")
         self.assertEqual(task["voice_name"], "ar-SA-HamedNeural")
         self.assertEqual(task["video_concat_mode"], "sequential")
+        self.assertEqual(task["video_clip_duration"], 64)
+        staged = Path(task["video_materials"][0]["url"])
+        staged.relative_to(self.root / "storage" / "local_videos")
+        self.assertEqual(staged.read_bytes(), self.asset.read_bytes())
+        self.assertEqual(review["source_assets"], [str(self.asset)])
+        self.assertEqual(review["staged_assets"], [str(staged)])
 
 
 if __name__ == "__main__":

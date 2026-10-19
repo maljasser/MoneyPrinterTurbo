@@ -7,9 +7,11 @@ This keeps channel copy, an English localization draft, and the review gate toge
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -43,6 +45,9 @@ def _read_episode(path: Path) -> dict:
         raise EpisodeError("aspect must be 9:16 or 16:9")
     if episode.get("status", "draft") not in {"draft", "approved"}:
         raise EpisodeError("status must be draft or approved")
+    clip_duration = episode.get("video_clip_duration", 5)
+    if type(clip_duration) is not int or not 1 <= clip_duration <= 120:
+        raise EpisodeError("video_clip_duration must be an integer from 1 to 120")
     materials = episode.get("materials", [])
     if not isinstance(materials, list) or not all(
         isinstance(item, str) and item.strip() for item in materials
@@ -101,7 +106,7 @@ def _engine_task(episode: dict, assets: list[Path]) -> dict:
         "video_aspect": episode.get("aspect", "9:16"),
         "video_fit_mode": "contain",
         "video_concat_mode": "sequential",
-        "video_clip_duration": 5,
+        "video_clip_duration": episode.get("video_clip_duration", 5),
         "video_count": 1,
         "voice_name": episode.get("voice_name", DEFAULT_VOICE),
         "voice_rate": 1.0,
@@ -163,6 +168,19 @@ def render(episode_path: Path) -> Path:
         raise EpisodeError(f"Arabic font is missing: {task['font_name']}")
     _check_no_auto_upload(_config_path())
 
+    # The engine restricts local footage to storage/local_videos. Copy only
+    # after the approval/config/font gates; never relax that engine boundary.
+    staged_dir = ROOT / "storage" / "local_videos" / "fiknova" / episode["id"]
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    staged_assets = []
+    for index, asset in enumerate(assets):
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()[:16]
+        staged = staged_dir / f"{index:02d}-{digest}{asset.suffix.lower()}"
+        if staged.resolve() != asset.resolve():
+            shutil.copyfile(asset, staged)
+        staged_assets.append(staged)
+    task = _engine_task(episode, staged_assets)
+
     output_dir = ROOT / "storage" / "fiknova" / episode["id"]
     output_dir.mkdir(parents=True, exist_ok=True)
     batch_file = output_dir / "mpt-task.json"
@@ -185,6 +203,7 @@ def render(episode_path: Path) -> Path:
         "script_en_for_localization_review": episode["script_en"],
         "publication": "not published; review required",
         "source_assets": [str(asset) for asset in assets],
+        "staged_assets": [str(asset) for asset in staged_assets],
         "engine_result": result,
     }
     record_path = output_dir / "review.json"
